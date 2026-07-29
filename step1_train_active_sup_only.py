@@ -12,8 +12,6 @@ import yaml
 
 _path = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'utils')
 sys.path.append(_path)
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-
 from tqdm import tqdm
 
 from data import create_dataset
@@ -70,12 +68,18 @@ def train(cfg, writer, logger):
     print('val batchsize is {}'.format(val_loader.batch_size))
 
     # load CAU
-    CAU_full = torch.load('anchors/cluster_centroids_sub_10.pkl')
-    CAU_full = CAU_full.reshape(10, 19, 256)
+    selection_dir = cfg['selection']['output_dir']
+    CAU_full = np.load(os.path.join(selection_dir, 'source_centroids.npy'))
+    CAU_full = CAU_full.reshape(
+        cfg['selection']['num_centroids'],
+        cfg['data']['n_class'],
+        cfg['selection']['feature_dim'],
+    )
     model.centroids = CAU_full
 
     # begin training
     model.iter = 0
+    train_start_ts = time.time()
     for epoch in range(epoches):
         if not flag_train:
             break
@@ -98,7 +102,6 @@ def train(cfg, writer, logger):
             target_label = target_label.to(device)
             active_images = active_images.to(device)
             active_labels = active_labels.to(device)
-            model.scheduler_step()
             model.train(logger=logger)
             if cfg['training'].get('freeze_bn') == True:
                 model.freeze_bn_apply()
@@ -106,39 +109,45 @@ def train(cfg, writer, logger):
 
             loss, loss_active = model.step_active_stage1(images, labels, target_image, target_label, active_images,
                                                          active_labels)
+            model.scheduler_step()
 
             time_meter.update(time.time() - start_ts)
-            if (i + 1) % cfg['training']['print_interval'] == 0:
+            if i % cfg['training']['print_interval'] == 0:
                 unchanged_cls_num = 0
-                fmt_str = "Epoches [{:d}/{:d}] Iter [{:d}/{:d}]  Loss: {:.4f}  Loss active: {:.4f}  Time/Image: {:.4f}"
+                elapsed = time.time() - train_start_ts
+                eta_hours = elapsed / max(1, i) * (
+                    cfg['training']['train_iters'] - i
+                ) / 3600.0
+                fmt_str = "Epoches [{:d}/{:d}] Iter [{:d}/{:d}]  Loss: {:.4f}  Loss active: {:.4f}  Time/Image: {:.4f}  ETA: {:.2f}h"
                 print_str = fmt_str.format(
                     epoch + 1,
                     epoches,
-                    i + 1,
+                    i,
                     cfg['training']['train_iters'],
                     loss.item(),
                     loss_active.item(),
-                    time_meter.avg / cfg['data']['source']['batch_size'])
+                    time_meter.avg / cfg['data']['source']['batch_size'],
+                    eta_hours)
 
                 print(print_str)
                 logger.info(print_str)
                 logger.info('unchanged number of objective class vector: {}'.format(unchanged_cls_num))
-                writer.add_scalar('loss/train_loss', loss.item(), i + 1)
+                writer.add_scalar('loss/train_loss', loss.item(), i)
 
-                writer.add_scalar('loss/train_activeLoss', loss_active, i + 1)
+                writer.add_scalar('loss/train_activeLoss', loss_active, i)
                 time_meter.reset()
 
             # evaluation
-            if (i + 1) % cfg['training']['val_interval'] == 0 or \
-                    (i + 1) == cfg['training']['train_iters']:
+            if i % cfg['training']['val_interval'] == 0 or \
+                    i == cfg['training']['train_iters']:
                 validation(
                     model, logger, writer, datasets, device, running_metrics_val, val_loss_meter, loss_fn,
                     source_val_loss_meter, source_running_metrics_val, iters=model.iter
                 )
                 torch.cuda.empty_cache()
                 logger.info('Best iou until now is {}'.format(model.best_iou))
-            if (i + 1) == cfg['training']['train_iters']:
-                flag = False
+            if i == cfg['training']['train_iters']:
+                flag_train = False
                 break
 
 
@@ -159,21 +168,21 @@ def validation(model, logger, writer, datasets, device, running_metrics_val, val
             val_loss_meter, loss_fn
         )
 
-    writer.add_scalar('loss/val_loss', val_loss_meter.avg, iters + 1)
-    logger.info("Iter %d Loss: %.4f" % (iters + 1, val_loss_meter.avg))
+    writer.add_scalar('loss/val_loss', val_loss_meter.avg, iters)
+    logger.info("Iter %d Loss: %.4f" % (iters, val_loss_meter.avg))
 
-    writer.add_scalar('loss/source_val_loss', source_val_loss_meter.avg, iters + 1)
-    logger.info("Iter %d Source Loss: %.4f" % (iters + 1, source_val_loss_meter.avg))
+    writer.add_scalar('loss/source_val_loss', source_val_loss_meter.avg, iters)
+    logger.info("Iter %d Source Loss: %.4f" % (iters, source_val_loss_meter.avg))
 
     score, class_iou = running_metrics_val.get_scores()
     for k, v in score.items():
         print(k, v)
         logger.info('{}: {}'.format(k, v))
-        writer.add_scalar('val_metrics/{}'.format(k), v, iters + 1)
+        writer.add_scalar('val_metrics/{}'.format(k), v, iters)
 
     for k, v in class_iou.items():
         logger.info('{}: {}'.format(k, v))
-        writer.add_scalar('val_metrics/cls_{}'.format(k), v, iters + 1)
+        writer.add_scalar('val_metrics/cls_{}'.format(k), v, iters)
 
     val_loss_meter.reset()
     running_metrics_val.reset()
@@ -192,14 +201,12 @@ def validation(model, logger, writer, datasets, device, running_metrics_val, val
             "scheduler_state": model.schedulers[_k].state_dict(),
         }
         state[net.__class__.__name__] = new_state
-    state['iter'] = iters + 1
+    state['iter'] = iters
     state['best_iou'] = score["Mean IoU : \t"]
-    save_path = os.path.join(writer.file_writer.get_logdir(),
-                             "from_{}_to_{}_on_{}_current_model.pkl".format(
-                                 cfg['data']['source']['name'],
-                                 cfg['data']['target']['name'],
-                                 cfg['model']['arch'], ))
+    run_dir = writer.file_writer.get_logdir()
+    save_path = os.path.join(run_dir, "model_current.pth")
     torch.save(state, save_path)
+    torch.save(state, os.path.join(run_dir, f"model_iter_{iters}.pth"))
 
     if score["Mean IoU : \t"] >= model.best_iou:
         torch.cuda.empty_cache()
@@ -214,13 +221,9 @@ def validation(model, logger, writer, datasets, device, running_metrics_val, val
                 "scheduler_state": model.schedulers[_k].state_dict(),
             }
             state[net.__class__.__name__] = new_state
-        state['iter'] = iters + 1
+        state['iter'] = iters
         state['best_iou'] = model.best_iou
-        save_path = os.path.join(writer.file_writer.get_logdir(),
-                                 "from_{}_to_{}_on_{}_best_model.pkl".format(
-                                     cfg['data']['source']['name'],
-                                     cfg['data']['target']['name'],
-                                     cfg['model']['arch'], ))
+        save_path = os.path.join(run_dir, "model_best.pth")
         torch.save(state, save_path)
     return score["Mean IoU : \t"]
 
@@ -249,14 +252,17 @@ if __name__ == "__main__":
         default='configs/active_from_gta_to_city_stage1.yml',
         help="Configuration file to use"
     )
+    parser.add_argument("--run-dir", type=str, default=None)
 
     args = parser.parse_args()
 
     with open(args.config) as fp:
-        cfg = yaml.load(fp)
+        cfg = yaml.safe_load(fp)
 
-    run_id = random.randint(1, 100000)
-    logdir = os.path.join('runs', os.path.basename(args.config)[:-4], str(run_id))
+    logdir = args.run_dir or os.path.join(
+        cfg['experiment']['work_dir'], 'stage1'
+    )
+    os.makedirs(logdir, exist_ok=True)
     writer = SummaryWriter(log_dir=logdir)
 
     print('RUNDIR: {}'.format(logdir))

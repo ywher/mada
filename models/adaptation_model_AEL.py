@@ -5,7 +5,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.deeplab import DeepLab
+from models.segmentation_factory import (
+    build_lr_scheduler,
+    build_optimizer,
+    build_segmentor,
+)
 from models.sync_batchnorm import SynchronizedBatchNorm2d, DataParallelWithCallback
 from schedulers import get_scheduler
 from .utils import normalisation_pooling, dequeue_and_enqueue, label_onehot, \
@@ -18,9 +22,11 @@ class CustomModel:
         # super(CustomModel, self).__init__()
         self.cfg = cfg
         self.writer = writer
-        self.class_numbers = 19
-        self.logger = logger
         cfg_model = cfg['model']
+        self.class_numbers = int(cfg['data']['n_class'])
+        self.feature_dim = int(cfg_model.get('feature_dim', 256))
+        self.num_centroids = int(cfg.get('selection', {}).get('num_centroids', 10))
+        self.logger = logger
         self.cfg_model = cfg_model
         self.best_iou = -100
         self.iter = 0
@@ -31,7 +37,9 @@ class CustomModel:
         self.valid_classes = cfg['training']['valid_classes']
         self.G_train = True
         self.cls_feature_weight = cfg['training']['cls_feature_weight']
-        self.centroids = np.zeros((10, 19, 256)).astype('float32')
+        self.centroids = np.zeros(
+            (self.num_centroids, self.class_numbers, self.feature_dim)
+        ).astype('float32')
 
         bn = cfg_model['bn']
         if bn == 'sync_bn':
@@ -42,25 +50,14 @@ class CustomModel:
             BatchNorm = nn.GroupNorm
         else:
             raise NotImplementedError('batch norm choice {} is not implemented'.format(bn))
-        self.PredNet = DeepLab(
-            num_classes=19,
-            backbone=cfg_model['basenet']['version'],
-            output_stride=16,
-            bn=cfg_model['bn'],
-            freeze_bn=True,
-        ).cuda()
-        self.load_PredNet(cfg, writer, logger, dir=None, net=self.PredNet)
+        self.PredNet = build_segmentor(cfg, freeze_bn=True)
+        if cfg['training'].get('Pred_resume'):
+            self.load_PredNet(cfg, writer, logger, dir=None, net=self.PredNet)
         self.PredNet_DP = self.init_device(self.PredNet, gpu_id=self.default_gpu, whether_DP=True)
         self.PredNet.eval()
         self.PredNet_num = 0
 
-        self.BaseNet = DeepLab(
-            num_classes=19,
-            backbone=cfg_model['basenet']['version'],
-            output_stride=16,
-            bn=cfg_model['bn'],
-            freeze_bn=False,
-        )
+        self.BaseNet = build_segmentor(cfg, freeze_bn=False)
 
         logger.info('the backbone is {}'.format(cfg_model['basenet']['version']))
 
@@ -71,18 +68,10 @@ class CustomModel:
         self.optimizers = []
         self.schedulers = []
         # optimizer_cls = get_optimizer(cfg)
-        optimizer_cls = torch.optim.SGD
-        optimizer_params = {k: v for k, v in cfg['training']['optimizer'].items()
-                            if k != 'name'}
-        # optimizer_cls_D = torch.optim.SGD
-        # optimizer_params_D = {k:v for k, v in cfg['training']['optimizer_D'].items()
-        #                     if k != 'name'}
-        # self.BaseOpti = optimizer_cls(self.BaseNet.parameters(), **optimizer_params)
-        self.BaseOpti = optimizer_cls(self.BaseNet.optim_parameters(cfg['training']['optimizer']['lr']),
-                                      **optimizer_params)
+        self.BaseOpti = build_optimizer(self.BaseNet, cfg)
         self.optimizers.extend([self.BaseOpti])
 
-        self.BaseSchedule = get_scheduler(self.BaseOpti, cfg['training']['lr_schedule'])
+        self.BaseSchedule = build_lr_scheduler(self.BaseNet, self.BaseOpti, cfg)
         self.schedulers.extend([self.BaseSchedule])
         self.setup(cfg, writer, logger)
 
@@ -101,7 +90,7 @@ class CustomModel:
         self.queue_ptrlis = []
         self.queue_size = []
         for i in range(cfg["data"]["n_class"]):
-            self.memobank.append([torch.zeros(0, 256)])
+            self.memobank.append([torch.zeros(0, self.feature_dim)])
             self.queue_size.append(30000)
             self.queue_ptrlis.append(torch.zeros(1, dtype=torch.long))
         self.queue_size[0] = 50000
@@ -112,7 +101,7 @@ class CustomModel:
                 cfg["data"]["n_class"],
                 cfg["U2PL"]["contrastive"]["num_queries"],
                 1,
-                256,
+                self.feature_dim,
             )
         ).cuda()
 
@@ -136,8 +125,13 @@ class CustomModel:
                 torch.rand(3, self.class_numbers).type(torch.float32).cuda()
             )
         if self.acm:
+            target_pool_size = int(cfg['data']['target'].get('pool_size', 0))
+            if target_pool_size <= 0:
+                raise ValueError(
+                    'data.target.pool_size must be set for MADAv2 stage 2'
+                )
             cutmix_bank = torch.zeros(
-                self.class_numbers, 2975  # target_train_loader.dataset.__len__()
+                self.class_numbers, target_pool_size
             ).cuda()
 
         self.criterion = criterion
@@ -169,13 +163,7 @@ class CustomModel:
                 self.area_thresh2 = self.area_thresh
 
     def create_PredNet(self, ):
-        ss = DeepLab(
-            num_classes=19,
-            backbone=self.cfg_model['basenet']['version'],
-            output_stride=16,
-            bn=self.cfg_model['bn'],
-            freeze_bn=True,
-        ).cuda()
+        ss = build_segmentor(self.cfg, freeze_bn=True).cuda()
         ss.eval()
         return ss
 
@@ -185,11 +173,12 @@ class CustomModel:
         """
         for net in self.nets:
             # name = net.__class__.__name__
-            self.init_weights(cfg['model']['init'], logger, net)
-            print("Initializition completed")
-            if hasattr(net, '_load_pretrained_model') and cfg['model']['pretrained']:
-                print("loading pretrained model for {}".format(net.__class__.__name__))
-                net._load_pretrained_model()
+            if not getattr(net, 'skip_generic_init', False):
+                self.init_weights(cfg['model']['init'], logger, net)
+                print("Initializition completed")
+                if hasattr(net, '_load_pretrained_model') and cfg['model']['pretrained']:
+                    print("loading pretrained model for {}".format(net.__class__.__name__))
+                    net._load_pretrained_model()
         '''load pretrained model'''
         if cfg['training']['resume_flag']:
             self.load_nets(cfg, writer, logger)
@@ -330,10 +319,11 @@ class CustomModel:
                     self.class_numbers
                 )
                 # perform momentum update
-                class_criterion = (
+                self.class_criterion = (
                         self.class_criterion * self.class_momentum
                         + category_entropy.cuda() * (1 - self.class_momentum)
                 )
+                class_criterion = self.class_criterion
         if isinstance(self.criterion_cons, torch.nn.CrossEntropyLoss):
             loss_consistency1 = (
                 self.criterion_cons(preds_student_sup, logits_teacher_sup)
@@ -377,7 +367,10 @@ class CustomModel:
             target_outputs_argmax = target_outputs_softmax.argmax(dim=1, keepdim=True)
             target_vectors, target_ids = self.calculate_mean_vector(target_feat_cls, target_output,
                                                                     target_outputs_argmax.float())
-            target_objective_vectors = torch.zeros([19, 256]).cuda()
+            target_objective_vectors = torch.zeros(
+                [self.class_numbers, self.feature_dim],
+                device=target_feat_cls.device,
+            )
             for t in range(len(target_ids)):
                 target_objective_vectors[target_ids[t]] = target_vectors[t].squeeze()
             # calculate min distance
@@ -498,10 +491,11 @@ class CustomModel:
                     self.class_numbers
                 )
                 # perform momentum update
-                class_criterion = (
+                self.class_criterion = (
                         self.class_criterion * self.class_momentum
                         + category_entropy.cuda() * (1 - self.class_momentum)
                 )
+                class_criterion = self.class_criterion
         if isinstance(self.criterion_cons, torch.nn.CrossEntropyLoss):
             loss_consistency1 = (
                 self.criterion_cons(preds_student_sup, logits_teacher_sup)
@@ -545,7 +539,10 @@ class CustomModel:
             target_outputs_argmax = target_outputs_softmax.argmax(dim=1, keepdim=True)
             target_vectors, target_ids = self.calculate_mean_vector(target_feat_cls, target_output,
                                                                     target_outputs_argmax.float())
-            target_objective_vectors = torch.zeros([19, 256]).cuda()
+            target_objective_vectors = torch.zeros(
+                [self.class_numbers, self.feature_dim],
+                device=target_feat_cls.device,
+            )
             for t in range(len(target_ids)):
                 target_objective_vectors[target_ids[t]] = target_vectors[t].squeeze()
             # calculate min distance
@@ -577,8 +574,11 @@ class CustomModel:
 
     def process_label(self, label):
         batch, channel, w, h = label.size()
-        pred1 = torch.zeros(batch, 20, w, h).cuda()
-        id = torch.where(label < 19, label, torch.Tensor([19]).cuda())
+        pred1 = torch.zeros(
+            batch, self.class_numbers + 1, w, h, device=label.device
+        )
+        ignored = torch.full_like(label, self.class_numbers)
+        id = torch.where(label < self.class_numbers, label, ignored)
         pred1 = pred1.scatter_(1, id.long(), 1)
         return pred1
 
@@ -698,6 +698,9 @@ class CustomModel:
         pass
 
     def adaptive_load_nets(self, net, model_weight):
+        if isinstance(net, nn.Module):
+            net.load_state_dict(model_weight, strict=False)
+            return
         model_dict = net.state_dict()
         pretrained_dict = {k: v for k, v in model_weight.items() if k in model_dict}
         model_dict.update(pretrained_dict)
@@ -721,7 +724,11 @@ class CustomModel:
                 if cfg['training']['optimizer_resume']:
                     self.adaptive_load_nets(self.optimizers[_k], checkpoint[name]["optimizer_state"])
                     self.adaptive_load_nets(self.schedulers[_k], checkpoint[name]["scheduler_state"])
-            self.iter = checkpoint["iter"]
+            self.iter = (
+                0
+                if cfg['training'].get('reset_iter_on_resume', False)
+                else checkpoint["iter"]
+            )
             self.best_iou = checkpoint['best_iou']
             logger.info(
                 "Loaded checkpoint '{}' (iter {})".format(

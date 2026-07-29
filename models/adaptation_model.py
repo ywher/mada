@@ -6,7 +6,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from loss import get_loss_function
-from models.deeplab import DeepLab
+from models.segmentation_factory import (
+    build_lr_scheduler,
+    build_optimizer,
+    build_segmentor,
+)
 from models.sync_batchnorm import SynchronizedBatchNorm2d, DataParallelWithCallback
 from schedulers import get_scheduler
 from .utils import normalisation_pooling
@@ -17,9 +21,11 @@ class CustomModel:
         # super(CustomModel, self).__init__()
         self.cfg = cfg
         self.writer = writer
-        self.class_numbers = 19
-        self.logger = logger
         cfg_model = cfg['model']
+        self.class_numbers = int(cfg['data']['n_class'])
+        self.feature_dim = int(cfg_model.get('feature_dim', 256))
+        self.num_centroids = int(cfg.get('selection', {}).get('num_centroids', 10))
+        self.logger = logger
         self.cfg_model = cfg_model
         self.best_iou = -100
         self.iter = 0
@@ -30,7 +36,9 @@ class CustomModel:
         self.valid_classes = cfg['training']['valid_classes']
         self.G_train = True
         self.cls_feature_weight = cfg['training']['cls_feature_weight']
-        self.centroids = np.zeros((10, 19, 256)).astype('float32')
+        self.centroids = np.zeros(
+            (self.num_centroids, self.class_numbers, self.feature_dim)
+        ).astype('float32')
 
         bn = cfg_model['bn']
         if bn == 'sync_bn':
@@ -41,25 +49,14 @@ class CustomModel:
             BatchNorm = nn.GroupNorm
         else:
             raise NotImplementedError('batch norm choice {} is not implemented'.format(bn))
-        self.PredNet = DeepLab(
-            num_classes=19,
-            backbone=cfg_model['basenet']['version'],
-            output_stride=16,
-            bn=cfg_model['bn'],
-            freeze_bn=True,
-        ).cuda()
-        self.load_PredNet(cfg, writer, logger, dir=None, net=self.PredNet)
+        self.PredNet = build_segmentor(cfg, freeze_bn=True)
+        if cfg['training'].get('Pred_resume'):
+            self.load_PredNet(cfg, writer, logger, dir=None, net=self.PredNet)
         self.PredNet_DP = self.init_device(self.PredNet, gpu_id=self.default_gpu, whether_DP=True)
         self.PredNet.eval()
         self.PredNet_num = 0
 
-        self.BaseNet = DeepLab(
-            num_classes=19,
-            backbone=cfg_model['basenet']['version'],
-            output_stride=16,
-            bn=cfg_model['bn'],
-            freeze_bn=False,
-        )
+        self.BaseNet = build_segmentor(cfg, freeze_bn=False)
 
         logger.info('the backbone is {}'.format(cfg_model['basenet']['version']))
 
@@ -70,17 +67,10 @@ class CustomModel:
         self.optimizers = []
         self.schedulers = []
         # optimizer_cls = get_optimizer(cfg)
-        optimizer_cls = torch.optim.SGD
-        optimizer_params = {k: v for k, v in cfg['training']['optimizer'].items()
-                            if k != 'name'}
-        # optimizer_cls_D = torch.optim.SGD
-        # optimizer_params_D = {k:v for k, v in cfg['training']['optimizer_D'].items() 
-        #                     if k != 'name'}
-        # self.BaseOpti = optimizer_cls(self.BaseNet.parameters(), **optimizer_params)
-        self.BaseOpti = optimizer_cls(self.BaseNet.optim_parameters(cfg['training']['optimizer']['lr']), **optimizer_params)
+        self.BaseOpti = build_optimizer(self.BaseNet, cfg)
         self.optimizers.extend([self.BaseOpti])
 
-        self.BaseSchedule = get_scheduler(self.BaseOpti, cfg['training']['lr_schedule'])
+        self.BaseSchedule = build_lr_scheduler(self.BaseNet, self.BaseOpti, cfg)
         self.schedulers.extend([self.BaseSchedule])
         self.setup(cfg, writer, logger)
 
@@ -94,13 +84,7 @@ class CustomModel:
         self.triplet_loss = nn.TripletMarginLoss()
 
     def create_PredNet(self, ):
-        ss = DeepLab(
-            num_classes=19,
-            backbone=self.cfg_model['basenet']['version'],
-            output_stride=16,
-            bn=self.cfg_model['bn'],
-            freeze_bn=True,
-        ).cuda()
+        ss = build_segmentor(self.cfg, freeze_bn=True).cuda()
         ss.eval()
         return ss
 
@@ -110,11 +94,12 @@ class CustomModel:
         '''
         for net in self.nets:
             # name = net.__class__.__name__
-            self.init_weights(cfg['model']['init'], logger, net)
-            print("Initializition completed")
-            if hasattr(net, '_load_pretrained_model') and cfg['model']['pretrained']:
-                print("loading pretrained model for {}".format(net.__class__.__name__))
-                net._load_pretrained_model()
+            if not getattr(net, 'skip_generic_init', False):
+                self.init_weights(cfg['model']['init'], logger, net)
+                print("Initializition completed")
+                if hasattr(net, '_load_pretrained_model') and cfg['model']['pretrained']:
+                    print("loading pretrained model for {}".format(net.__class__.__name__))
+                    net._load_pretrained_model()
         '''load pretrained model
         '''
         if cfg['training']['resume_flag']:
@@ -182,8 +167,11 @@ class CustomModel:
 
     def process_label(self, label):
         batch, channel, w, h = label.size()
-        pred1 = torch.zeros(batch, 20, w, h).cuda()
-        id = torch.where(label < 19, label, torch.Tensor([19]).cuda())
+        pred1 = torch.zeros(
+            batch, self.class_numbers + 1, w, h, device=label.device
+        )
+        ignored = torch.full_like(label, self.class_numbers)
+        id = torch.where(label < self.class_numbers, label, ignored)
         pred1 = pred1.scatter_(1, id.long(), 1)
         return pred1
 
@@ -303,6 +291,9 @@ class CustomModel:
         pass
 
     def adaptive_load_nets(self, net, model_weight):
+        if isinstance(net, nn.Module):
+            net.load_state_dict(model_weight, strict=False)
+            return
         model_dict = net.state_dict()
         pretrained_dict = {k: v for k, v in model_weight.items() if k in model_dict}
         model_dict.update(pretrained_dict)
@@ -326,7 +317,11 @@ class CustomModel:
                 if cfg['training']['optimizer_resume']:
                     self.adaptive_load_nets(self.optimizers[_k], checkpoint[name]["optimizer_state"])
                     self.adaptive_load_nets(self.schedulers[_k], checkpoint[name]["scheduler_state"])
-            self.iter = checkpoint["iter"]
+            self.iter = (
+                0
+                if cfg['training'].get('reset_iter_on_resume', False)
+                else checkpoint["iter"]
+            )
             self.best_iou = checkpoint['best_iou']
             logger.info(
                 "Loaded checkpoint '{}' (iter {})".format(

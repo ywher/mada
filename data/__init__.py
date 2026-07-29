@@ -122,14 +122,31 @@ class CustomDatasetDataLoader():
             active_train = find_dataset_using_name(cfg_active['name'])
             augmentations = cfg['training'].get('augmentations', None)
             data_aug = get_composed_augmentations(augmentations)
-            self.active_train = active_train(cfg_active, writer, logger, augmentations=data_aug)
+            ael_cfg = cfg.get('AEL', {})
+            acp_cfg = ael_cfg.get('acp', False)
+            acp_enabled = bool(acp_cfg)
+            acp_prob = (
+                float(acp_cfg.get('prob', 0.5))
+                if isinstance(acp_cfg, dict)
+                else 0.5
+            )
+            active_kwargs = {}
+            if cfg_active['name'].lower().endswith('_ael'):
+                active_kwargs.update(acp=acp_enabled, prob=acp_prob)
+            self.active_train = active_train(
+                cfg_active,
+                writer,
+                logger,
+                augmentations=data_aug,
+                **active_kwargs,
+            )
             logger.info("{} active dataset has been created".format(self.active_train.__class__.__name__))
             print("dataset {} for active was created".format(self.active_train.__class__.__name__))
 
             self.active_train_loader = DataProvider(
                 dataset=self.active_train,
-                batch_size=cfg_source['batch_size'],
-                shuffle=cfg_source['shuffle'],
+                batch_size=cfg_active.get('batch_size', cfg_source['batch_size']),
+                shuffle=cfg_active.get('shuffle', True),
                 num_workers=int(cfg['data']['num_workers']),
                 drop_last=True,
                 pin_memory=True,
@@ -150,7 +167,7 @@ class CustomDatasetDataLoader():
                 batch_size=cfg_source_valid['batch_size'],
                 shuffle=cfg_source_valid['shuffle'],
                 num_workers=int(cfg['data']['num_workers']),
-                drop_last=True,
+                drop_last=False,
                 pin_memory=True,
             )
 
@@ -168,7 +185,7 @@ class CustomDatasetDataLoader():
                 batch_size=cfg_target_valid['batch_size'],
                 shuffle=cfg_target_valid['shuffle'],
                 num_workers=int(cfg['data']['num_workers']),
-                drop_last=True,
+                drop_last=False,
                 pin_memory=True,
             )
 

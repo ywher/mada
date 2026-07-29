@@ -1,4 +1,7 @@
 import math
+import os
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 import torch.utils.model_zoo as model_zoo
@@ -151,7 +154,21 @@ class ResNet(nn.Module):
     def _load_pretrained_model(self):
         pretrain_dict = None
         if self.version == 'resnet101':
-            pretrain_dict = torch.load('/remote-home/nmn/MADA/resnet101-5d3b4d8f.pth')
+            pretrained_path = os.environ.get(
+                'MADAV2_RESNET101_PRETRAINED',
+                str(
+                    Path(__file__).resolve().parents[2]
+                    / 'pretrained'
+                    / 'resnet101-5d3b4d8f.pth'
+                ),
+            )
+            if not os.path.isfile(pretrained_path):
+                raise FileNotFoundError(
+                    'ResNet-101 ImageNet checkpoint not found at '
+                    f'{pretrained_path}. Run scripts/setup_env.sh or set '
+                    'MADAV2_RESNET101_PRETRAINED.'
+                )
+            pretrain_dict = torch.load(pretrained_path, map_location='cpu')
             # model_zoo.load_url('https://download.pytorch.org/models/resnet101-5d3b4d8f.pth')
         elif self.version == 'resnet50':
             pretrain_dict = model_zoo.load_url('https://download.pytorch.org/models/resnet50-19c8e357.pth')
