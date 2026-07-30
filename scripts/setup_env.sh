@@ -88,7 +88,7 @@ for relative in \
 done
 
 conda run -n "${CONDA_ENV}" python -c \
-  "import sklearn, tensorboardX, timm, torch, torchvision, yaml; print('MADAv2 environment OK:', torch.__version__)"
+  "import skimage, sklearn, tensorboardX, timm, torch, torchvision, yaml; print('MADAv2 environment OK:', torch.__version__)"
 
 echo "Environment: ${CONDA_ENV}"
 echo "Dataset links: ${REPO_ROOT}/data/{gta,synthia,cityscapes,acdc,muses,mapillary}"
