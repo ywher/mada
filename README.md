@@ -140,6 +140,8 @@ source, selection, stage-1, and stage-2 artifacts are skipped on rerun.
 The launcher caps BLAS/OpenMP libraries at eight CPU threads to avoid
 OpenBLAS metadata overflows on high-core-count servers. Override this safe
 default with `MADAV2_BLAS_THREADS=<1--64>` when needed.
+Completed feature and centroid artifacts are reused when an interrupted
+acquisition is relaunched.
 
 Each experiment is saved as:
 

@@ -257,6 +257,29 @@ def timed(
     return result
 
 
+def timed_if_missing(
+    artifact,
+    output_dir,
+    name,
+    function,
+    *args,
+    timing_file="acquisition_timing.json",
+    **kwargs,
+):
+    artifact = Path(artifact)
+    if artifact.is_file() and artifact.stat().st_size > 0:
+        print(f"Reusing completed acquisition artifact: {artifact}")
+        return None
+    return timed(
+        output_dir,
+        name,
+        function,
+        *args,
+        timing_file=timing_file,
+        **kwargs,
+    )
+
+
 def run_initial_acquisition(cfg, checkpoint, device):
     output_dir = Path(cfg["selection"]["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -266,7 +289,8 @@ def run_initial_acquisition(cfg, checkpoint, device):
     target_centroids = output_dir / "target_warmup_centroids.npy"
     num_centroids = int(cfg["selection"]["num_centroids"])
     seed = int(cfg.get("seed", 1337))
-    timed(
+    timed_if_missing(
+        source_features,
         output_dir,
         "source_feature_extraction",
         extract_features,
@@ -276,7 +300,8 @@ def run_initial_acquisition(cfg, checkpoint, device):
         source_features,
         device,
     )
-    timed(
+    timed_if_missing(
+        source_centroids,
         output_dir,
         "source_clustering",
         cluster_features,
@@ -285,7 +310,8 @@ def run_initial_acquisition(cfg, checkpoint, device):
         num_centroids,
         seed,
     )
-    timed(
+    timed_if_missing(
+        target_features,
         output_dir,
         "target_feature_extraction",
         extract_features,
@@ -295,7 +321,8 @@ def run_initial_acquisition(cfg, checkpoint, device):
         target_features,
         device,
     )
-    timed(
+    timed_if_missing(
+        target_centroids,
         output_dir,
         "target_clustering",
         cluster_features,
@@ -304,7 +331,8 @@ def run_initial_acquisition(cfg, checkpoint, device):
         num_centroids,
         seed,
     )
-    timed(
+    timed_if_missing(
+        output_dir / "selected_images.txt",
         output_dir,
         "image_selection",
         select_images,
@@ -319,7 +347,8 @@ def run_post_stage1(cfg, checkpoint, device):
     output_dir = Path(cfg["selection"]["output_dir"])
     features = output_dir / "target_stage1_features.npy"
     centroids = output_dir / "target_stage1_centroids.npy"
-    timed(
+    timed_if_missing(
+        features,
         output_dir,
         "stage1_target_feature_extraction",
         extract_features,
@@ -330,7 +359,8 @@ def run_post_stage1(cfg, checkpoint, device):
         device,
         timing_file="stage2_preparation_timing.json",
     )
-    timed(
+    timed_if_missing(
+        centroids,
         output_dir,
         "stage1_target_clustering",
         cluster_features,
