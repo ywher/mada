@@ -13,6 +13,21 @@ STAGE1_ITERS="${STAGE1_ITERS:-20000}"
 SOURCE_ITERS="${SOURCE_ITERS:-40000}"
 WORKERS="${WORKERS:-4}"
 CONDA_ENV="${CONDA_ENV:-reinpy10}"
+BLAS_THREADS="${MADAV2_BLAS_THREADS:-8}"
+
+if [[ ! "${BLAS_THREADS}" =~ ^[0-9]+$ ]] ||
+   (( BLAS_THREADS < 1 || BLAS_THREADS > 64 )); then
+  echo "MADAV2_BLAS_THREADS must be an integer in [1, 64]." >&2
+  exit 2
+fi
+
+# Feature extraction is followed by NumPy/scikit-learn clustering. On hosts
+# exposing more than 64 CPU threads, OpenBLAS can otherwise exceed its
+# precompiled thread-metadata limit and segfault after extraction completes.
+export OPENBLAS_NUM_THREADS="${BLAS_THREADS}"
+export OMP_NUM_THREADS="${BLAS_THREADS}"
+export MKL_NUM_THREADS="${BLAS_THREADS}"
+export NUMEXPR_NUM_THREADS="${BLAS_THREADS}"
 
 RATIO="1_64"
 if [[ "${DATASET}" == "cityscapes2mapillary" ]]; then

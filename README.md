@@ -137,6 +137,9 @@ The pipeline trains a source-only initialization, extracts source/target
 features, clusters ten anchors per domain, records the exact selected image
 list, trains stage 1, refreshes target anchors, and trains stage 2. Completed
 source, selection, stage-1, and stage-2 artifacts are skipped on rerun.
+The launcher caps BLAS/OpenMP libraries at eight CPU threads to avoid
+OpenBLAS metadata overflows on high-core-count servers. Override this safe
+default with `MADAV2_BLAS_THREADS=<1--64>` when needed.
 
 Each experiment is saved as:
 
